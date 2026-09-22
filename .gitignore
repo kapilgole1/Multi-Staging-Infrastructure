@@ -1,0 +1,7 @@
+ssh-key-pair
+ssh-key-pair.pub
+terraform.tfstate.backup
+terraform.tfstate
+.terraform/modules/modules.json
+.terraform.lock.hcl
+.terraform/providers/registry.terraform.io/hashicorp/aws/6.66.0/windows_amd64/terraform-provider-aws_v6.66.0_x5.exe
