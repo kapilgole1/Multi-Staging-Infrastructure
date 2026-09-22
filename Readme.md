@@ -1,224 +1,170 @@
-# AWS Infrastructure with Terraform
+# Multi-Staging AWS Infrastructure with Terraform
 
-This project provisions AWS infrastructure using **Terraform** for three separate environments:
+This project provisions AWS infrastructure for three environments using one reusable Terraform module:
 
-* **Development**
-* **Testing**
-* **Production**
+- Development
+- Testing
+- Production
 
-The goal of this project is to build a reusable and environment-specific infrastructure setup using Terraform, following common Infrastructure as Code (IaC) practices.
+The root configuration in `main.tf` calls the reusable module in `Infrastructure/` once for each environment. Each module receives its own region, AMI ID, instance count, instance types, storage size, and environment name.
 
-## Environments
+## Architecture
 
-| Environment | Purpose                                           |
-| ----------- | ------------------------------------------------- |
-| Development | Used for development and experimentation          |
-| Testing     | Used for testing and validation before production |
-| Production  | Used to host production workloads                 |
+Each environment creates the following AWS resources:
 
-Each environment can have its own infrastructure configuration, resources, networking, and security settings.
+- VPC
+- Public subnet
+- Private subnet
+- Internet Gateway
+- NAT Gateway and Elastic IP
+- Route table and public subnet association
+- Security group
+- EC2 key pair
+- EC2 instances
+- S3 bucket
 
-## Infrastructure
-
-The infrastructure includes the following AWS resources:
-
-* VPC
-* Public and Private Subnets
-* Internet Gateway
-* NAT Gateway
-* Route Tables and Routes
-* Security Groups
-* EC2 Instances
-* EC2 Key Pair
-* S3 Bucket
-
-### High-Level Architecture
+The intended network layout is:
 
 ```text
-                         AWS
-                          |
-                         VPC
-                          |
-          +---------------+---------------+
-          |                               |
-     Public Subnet                   Private Subnet
-          |                               |
-     +----+----+                    +-----+-----+
-     |         |                    |           |
-    EC2      NAT GW                EC2       Resources
-     |         |
-     +----+----+
-          |
-     Internet Gateway
-          |
-       Internet
+AWS Region
+└── VPC
+    ├── Public Subnet
+    │   ├── EC2 instances
+    │   ├── NAT Gateway
+    │   └── Internet Gateway route
+    └── Private Subnet
+        └── Private resources
 ```
 
-> The exact architecture may vary between Development, Testing, and Production environments.
+## Environment Configuration
 
-## Terraform Structure
+The current values are defined in `main.tf`:
 
-A possible project structure is:
+| Environment | AWS Region | Instance Count | Public EC2 | Private EC2 | Root Volume |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Development | `ap-south-1` | 1 | 1 | 1 | 10 GB |
+| Production | `us-east-1` | 2 | 2 | 0 | 20 GB |
+| Testing | `us-east-2` | 1 | 1 | 1 | 15 GB |
+
+Production intentionally creates zero private-subnet EC2 instances with this module rule:
+
+```hcl
+count = var.env == "production" ? 0 : var.instance_count
+```
+
+The public instances still use `var.instance_count` in every environment.
+
+## Important Regional Rule
+
+AWS resources are regional. An AMI, subnet, VPC, security group, key pair, EBS snapshot, or Elastic IP created in one region cannot automatically be used in another region.
+
+For example, an AMI created in `ap-south-1` cannot be used to create an EC2 instance in `us-east-1` or `us-east-2`. Each environment must receive an AMI ID that exists in its own region. The current `main.tf` supplies separate AMI IDs for Development, Production, and Testing for this reason.
+
+Availability Zones also belong to a specific region. The subnet configuration currently builds the AZ from the selected region:
+
+```hcl
+availability_zone = "${var.region}a"
+```
+
+The resulting AZ must exist and be available in that region. For more flexible production deployments, use a data source to discover available AZs instead of assuming the `a` suffix.
+
+See [Result.md](Result.md) for the detailed regional resource lesson.
+
+## Project Structure
 
 ```text
-terraform-infrastructure/
-│
-├── environments/
-│   ├── development/
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   ├── outputs.tf
-│   │   └── terraform.tfvars
-│   │
-│   ├── testing/
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   ├── outputs.tf
-│   │   └── terraform.tfvars
-│   │
-│   └── production/
-│       ├── main.tf
-│       ├── variables.tf
-│       ├── outputs.tf
-│       └── terraform.tfvars
-│
-├── modules/
-│   ├── vpc/
-│   ├── subnet/
-│   ├── route/
-│   ├── security-group/
-│   ├── ec2/
-│   ├── key-pair/
-│   └── s3/
-│
-├── README.md
-└── instruction.md
+Multi Staging Infrastructure/
+├── main.tf                         # Root module and environment definitions
+├── Readme.md
+├── Result.md                       # Regional resource learning notes
+├── Instruction.md                  # AWS and Terraform instructions
+└── Infrastructure/                 # Reusable child module
+    ├── terraform.tf                # AWS provider requirement
+    ├── provider.tf                 # Provider region from var.region
+    ├── variable.tf                 # Module input variables
+    ├── vpc.tf                      # VPC
+    ├── subnet.tf                   # Public and private subnets
+    ├── igw.tf                      # Internet Gateway
+    ├── nat-gw.tf                   # NAT Gateway and Elastic IP
+    ├── route-table.tf              # Routes and associations
+    ├── ec2.tf                      # Security group and EC2 instances
+    ├── keypair.tf                  # EC2 key pair
+    ├── s3.tf                       # S3 bucket
+    └── install_nginx.sh            # EC2 user-data script
 ```
 
-## Requirements
+## Prerequisites
 
-Before using this project, install and configure:
+Install and configure:
 
-* Terraform
-* AWS CLI
-* AWS account
-* AWS credentials
-* SSH key pair or Terraform-managed EC2 key pair
+- Terraform
+- AWS CLI
+- An AWS account
+- AWS credentials with permission to create the listed resources
+- An EC2 key pair or the key material expected by `keypair.tf`
 
-Verify Terraform:
+Check the installations:
 
-```bash
+```powershell
 terraform version
-```
-
-Verify AWS CLI:
-
-```bash
 aws --version
-```
-
-Verify AWS credentials:
-
-```bash
 aws sts get-caller-identity
 ```
 
-## Deployment
+## Deploy
 
-Navigate to the required environment:
+Run Terraform from the project root, where `main.tf` is located:
 
-```bash
-cd environments/development
-```
-
-Initialize Terraform:
-
-```bash
+```powershell
+cd "K:\Learning\Terraform Daily-Prac\Multi Staging Infrastructure"
 terraform init
-```
-
-Validate the configuration:
-
-```bash
+terraform fmt -recursive
 terraform validate
-```
-
-Review the infrastructure changes:
-
-```bash
 terraform plan
-```
-
-Apply the infrastructure:
-
-```bash
 terraform apply
 ```
 
-To destroy the environment:
+Review the plan carefully before applying, especially because the configuration creates resources in three AWS regions.
 
-```bash
+To remove the managed infrastructure:
+
+```powershell
 terraform destroy
 ```
 
-The same process can be used for Testing and Production.
+## State Management
 
-## Environment Example
+Terraform stores the root configuration state in `terraform.tfstate` unless a backend is configured. Do not edit the state file manually.
 
-Development:
+For real environments:
 
-```bash
-cd environments/development
-terraform init
-terraform plan
-terraform apply
-```
+- Use separate state for Development, Testing, and Production.
+- Store state in an encrypted S3 backend.
+- Use DynamoDB or the supported Terraform locking mechanism for state locking.
+- Do not run multiple Terraform operations against the same state at the same time.
+- Back up state securely and do not commit sensitive state files to Git.
 
-Testing:
+## Current Learning Notes
 
-```bash
-cd environments/testing
-terraform init
-terraform plan
-terraform apply
-```
+This project demonstrates:
 
-Production:
+- Reusing one Terraform module for multiple environments
+- Passing environment-specific variables to child modules
+- Creating resources in different AWS regions
+- Understanding regional AMI and Availability Zone limitations
+- Using `count` to disable production private instances
+- Building VPC networking with public and private subnets
+- Managing Terraform state and reviewing plans
 
-```bash
-cd environments/production
-terraform init
-terraform plan
-terraform apply
-```
+## Security and Production Considerations
 
-## Terraform State
+This is a learning project and should be hardened before production use:
 
-Terraform state keeps track of the infrastructure resources managed by Terraform.
-
-For a real-world setup, Terraform state should be stored remotely, for example in an **Amazon S3 bucket**.
-
-State locking should also be configured where appropriate to prevent multiple Terraform operations from modifying the same state simultaneously.
-
-## Important Notes
-
-* Do not commit AWS access keys or secret credentials to Git.
-* Do not commit private SSH keys.
-* Use separate Terraform state for each environment.
-* Review `terraform plan` before applying changes.
-* Production infrastructure should be changed carefully.
-* Use variables instead of hardcoding environment-specific values.
-* Reusable Terraform modules should be used where possible.
-
-## Project Goal
-
-This project is intended as a practical Infrastructure as Code project for learning and practicing:
-
-* Terraform
-* AWS networking
-* EC2 provisioning
-* Infrastructure modularization
-* Environment separation
-* Terraform state management
-* Security configuration
-* AWS infrastructure automation
+- Restrict SSH access instead of allowing `0.0.0.0/0`.
+- Restrict HTTP ingress to the required sources.
+- Use private key files securely and never commit them.
+- Use private subnets without public IP address assignment for private resources.
+- The current private EC2 resource sets `associate_public_ip_address = true`; change this to `false` if private instances are enabled later.
+- Use region-specific or dynamically discovered AMIs.
+- Use separate state and backend configuration per environment.
+- Add outputs, monitoring, backups, and resource tagging standards.
