@@ -1,518 +1,293 @@
 # Infrastructure Instructions
 
-This document describes the AWS services used in this Terraform infrastructure and their purpose.
+This document explains how the Multi-Staging AWS Terraform project works and how to deploy it safely.
 
-The infrastructure is divided into three environments:
+## 1. Project Overview
 
-* Development
-* Testing
-* Production
+The project creates the same base infrastructure for three environments by calling one reusable child module three times from `main.tf`:
 
-Each environment is managed independently using Terraform.
+- Development: `ap-south-1`
+- Production: `us-east-1`
+- Testing: `us-east-2`
 
----
+The reusable module is located in `Infrastructure/`. The root module passes environment-specific values such as the AWS region, AMI ID, instance count, instance type, and root volume size.
 
-# AWS Services Used
-
-## 1. VPC
-
-**Amazon VPC (Virtual Private Cloud)** provides the isolated network in which the infrastructure is deployed.
-
-The VPC contains:
-
-* Subnets
-* Route tables
-* Internet Gateway
-* NAT Gateway
-* Security Groups
-* EC2 instances
-
-Example:
+## 2. Project Structure
 
 ```text
-VPC
-│
-├── Public Subnet
-│
-├── Private Subnet
-│
-├── Route Tables
-│
-├── Internet Gateway
-│
-└── NAT Gateway
+Multi Staging Infrastructure/
+├── main.tf
+├── Readme.md
+├── Result.md
+├── Instruction.md
+└── Infrastructure/
+    ├── terraform.tf
+    ├── provider.tf
+    ├── variable.tf
+    ├── vpc.tf
+    ├── subnet.tf
+    ├── igw.tf
+    ├── nat-gw.tf
+    ├── route-table.tf
+    ├── ec2.tf
+    ├── keypair.tf
+    ├── s3.tf
+    └── install_nginx.sh
 ```
 
-The VPC forms the foundation of the AWS networking architecture.
+## 3. Environment Values
 
----
+The current environment values are defined in `main.tf`:
 
-# 2. Subnets
+| Environment | Region | Instance Count | Public EC2 | Private EC2 | AMI |
+| --- | --- | ---: | ---: | ---: | --- |
+| Development | `ap-south-1` | 1 | 1 | 1 | `ami-01a00762f46d584a1` |
+| Production | `us-east-1` | 2 | 2 | 0 | `ami-0b6d9d3d33ba97d99` |
+| Testing | `us-east-2` | 1 | 1 | 1 | `ami-0e5497a77ef21b5ac` |
 
-Subnets divide the VPC into smaller network segments.
+Production private instances are intentionally disabled in `ec2.tf`:
 
-This infrastructure can use:
+```hcl
+count = var.env == "production" ? 0 : var.instance_count
+```
 
-* Public subnets
-* Private subnets
+The public EC2 resource still uses `var.instance_count`, so Production creates two public instances.
+
+## 4. Network Architecture
+
+Each environment creates its own VPC and networking resources:
+
+```text
+AWS Region
+└── VPC: 10.0.0.0/16
+    ├── Public Subnet: 10.0.1.0/24
+    │   ├── Public EC2 instances
+    │   ├── NAT Gateway
+    │   └── Internet Gateway route
+    └── Private Subnet: 10.0.2.0/24
+        └── Private EC2 instances when enabled
+```
+
+### VPC
+
+The VPC provides an isolated network for each environment. Its subnets, route tables, security group, NAT Gateway, and EC2 instances are created inside that VPC.
 
 ### Public Subnet
 
-A public subnet contains resources that need direct internet connectivity through an Internet Gateway.
+The public subnet is configured with:
 
-Example:
-
-```text
-Internet
-   |
-Internet Gateway
-   |
-Public Subnet
-   |
-EC2
+```hcl
+map_public_ip_on_launch = true
 ```
+
+It uses the public route table and Internet Gateway so resources can communicate directly with the internet when a public IP is assigned.
 
 ### Private Subnet
 
-A private subnet does not have a direct route to the Internet Gateway.
+The private subnet is intended for resources that should not be directly reachable from the internet. If private EC2 instances are enabled, outbound internet access should go through the NAT Gateway.
 
-If resources inside a private subnet need outbound internet access, they can use a NAT Gateway.
+The current subnet file sets `map_public_ip_on_launch = true` for the private subnet, and the private EC2 resource sets `associate_public_ip_address = true`. These settings should be changed to `false` before using private instances in a real production design.
 
-```text
-Private EC2
-    |
-Private Subnet
-    |
-NAT Gateway
-    |
-Internet Gateway
-    |
-Internet
-```
+## 5. Region and Availability Zone Rules
 
----
+AWS resources are regional. A resource created in one region cannot automatically be used in another region.
 
-# 3. Internet Gateway
+Examples:
 
-An **Internet Gateway (IGW)** allows resources in a VPC to communicate with the public internet.
+- An AMI from `ap-south-1` cannot be used directly in `us-east-1`.
+- A subnet from `us-east-1` cannot be attached to a VPC in `us-east-2`.
+- A key pair and security group must exist in the region where the EC2 instance is created.
+- EBS snapshots, Elastic IPs, and many other resources are also region-specific.
 
-It is attached to the VPC.
+The AMI passed to each module must exist in that module's region. If an AMI must be used in another region, copy the AMI first; AWS assigns a new AMI ID in the destination region.
 
-For a public subnet, the route table normally contains a route such as:
-
-```text
-0.0.0.0/0 → Internet Gateway
-```
-
-Example:
-
-```text
-Internet
-    |
-   IGW
-    |
-   VPC
-    |
-Public Subnet
-    |
-   EC2
-```
-
----
-
-# 4. Route Tables
-
-Route tables determine where network traffic is sent.
-
-A route table contains routes such as:
-
-```text
-Destination       Target
-0.0.0.0/0         Internet Gateway
-```
-
-For a private subnet using a NAT Gateway:
-
-```text
-Destination       Target
-0.0.0.0/0         NAT Gateway
-```
-
-Typical architecture:
-
-```text
-Public Route Table
-        |
-        +---- 0.0.0.0/0 → IGW
-        |
-   Public Subnet
-
-
-Private Route Table
-        |
-        +---- 0.0.0.0/0 → NAT Gateway
-        |
-   Private Subnet
-```
-
----
-
-# 5. NAT Gateway
-
-A **NAT Gateway** allows resources in private subnets to initiate outbound connections to the internet without allowing unsolicited inbound connections from the internet.
-
-Example:
-
-```text
-Private EC2
-     |
-Private Subnet
-     |
-Route Table
-     |
-NAT Gateway
-     |
-Internet Gateway
-     |
-Internet
-```
-
-A common use case is allowing a private EC2 instance to download packages or updates.
-
-For example:
-
-```bash
-sudo apt update
-```
-
-The EC2 instance can access the internet through the NAT Gateway while remaining in a private subnet.
-
-> NAT Gateway has an AWS cost, so it should be used carefully in learning environments.
-
----
-
-# 6. Security Groups
-
-Security Groups act as virtual firewalls for resources such as EC2 instances.
-
-Rules determine which traffic is allowed.
-
-Example:
-
-```text
-Inbound
---------------------------------
-SSH       TCP 22     Your IP
-HTTP      TCP 80     0.0.0.0/0
-HTTPS     TCP 443    0.0.0.0/0
-```
-
-Outbound traffic can also be controlled.
-
-For example, an EC2 security group may allow:
-
-```text
-Internet
-   |
-   | TCP 80
-   ↓
-EC2
-```
-
-Security Groups are **stateful**, meaning return traffic for an allowed connection is automatically permitted.
-
----
-
-# 7. EC2
-
-**Amazon EC2 (Elastic Compute Cloud)** provides virtual servers.
-
-This infrastructure uses EC2 instances to run workloads inside the VPC.
-
-An EC2 instance can be deployed into either:
-
-* Public subnet
-* Private subnet
-
-Example:
-
-```text
-VPC
-│
-├── Public Subnet
-│      |
-│      └── EC2
-│
-└── Private Subnet
-       |
-       └── EC2
-```
-
-Terraform can manage:
-
-* AMI
-* Instance type
-* Subnet
-* Security Group
-* Key Pair
-* Root volume
-* Tags
-* User data
-
-Example Terraform resource:
+The current subnets derive their Availability Zone from the region:
 
 ```hcl
-resource "aws_instance" "example" {
-  ami           = var.ami_id
-  instance_type = var.instance_type
-
-  subnet_id = aws_subnet.public.id
-
-  security_groups = [
-    aws_security_group.example.id
-  ]
-
-  tags = {
-    Name        = "example-server"
-    Environment = var.environment
-  }
-}
+availability_zone = "${var.region}a"
 ```
 
----
+An Availability Zone belongs to one region only. The resulting AZ must be available in the selected region and account. A more flexible design should discover available AZs with a data source instead of assuming the `a` suffix.
 
-# 8. Key Pair
+## 6. AWS Services
 
-An EC2 Key Pair is used for SSH access to Linux EC2 instances.
+### Internet Gateway
 
-Example:
+The Internet Gateway connects the VPC to the public internet. The public route table sends internet-bound traffic to the Internet Gateway.
 
-```bash
-ssh -i my-key.pem ubuntu@<EC2_PUBLIC_IP>
-```
+### NAT Gateway
 
-Terraform can create or reference an AWS EC2 Key Pair.
+The NAT Gateway allows instances in a private subnet to start outbound connections without accepting unsolicited inbound internet connections. NAT Gateways have an AWS usage cost.
 
-Example:
+### Route Tables
 
-```hcl
-resource "aws_key_pair" "example" {
-  key_name   = "example-key"
-  public_key = file("~/.ssh/id_rsa.pub")
-}
-```
-
-The private key should never be committed to Git.
-
----
-
-# 9. S3
-
-**Amazon S3 (Simple Storage Service)** is object storage.
-
-In this infrastructure, S3 can be used for purposes such as:
-
-* Terraform remote state
-* Terraform state backups/versioning
-* Application logs
-* Configuration files
-* Backup files
-* Infrastructure artifacts
-
-For Terraform state, an S3 bucket can be configured as the remote backend.
-
-Example:
-
-```hcl
-terraform {
-  backend "s3" {
-    bucket = "my-terraform-state"
-    key    = "terraform/state"
-    region = "ap-south-1"
-  }
-}
-```
-
-For multiple environments, the state should be separated so that Development, Testing, and Production do not accidentally use the same state.
-
-Example:
+Route tables control traffic flow:
 
 ```text
-S3 Bucket
-│
-└── terraform-state/
-    │
-    ├── development/
-    │   └── terraform.tfstate
-    │
-    ├── testing/
-    │   └── terraform.tfstate
-    │
-    └── production/
-        └── terraform.tfstate
+Public route:  0.0.0.0/0 -> Internet Gateway
+Private route: 0.0.0.0/0 -> NAT Gateway
 ```
 
----
+The current route configuration should be reviewed before enabling private EC2 instances, especially if private route-table association is added later.
 
-# Environment Architecture
+### Security Group
 
-Each environment represents a separate deployment of the infrastructure.
+The EC2 security group currently allows:
 
-```text
-AWS
-│
-├── Development
-│   ├── VPC
-│   ├── Subnets
-│   ├── Route Tables
-│   ├── IGW
-│   ├── NAT Gateway
-│   ├── Security Groups
-│   └── EC2
-│
-├── Testing
-│   ├── VPC
-│   ├── Subnets
-│   ├── Route Tables
-│   ├── IGW
-│   ├── NAT Gateway
-│   ├── Security Groups
-│   └── EC2
-│
-└── Production
-    ├── VPC
-    ├── Subnets
-    ├── Route Tables
-    ├── IGW
-    ├── NAT Gateway
-    ├── Security Groups
-    └── EC2
+| Direction | Protocol | Port | Source |
+| --- | --- | ---: | --- |
+| Inbound | TCP | 22 | `0.0.0.0/0` |
+| Inbound | TCP | 80 | `0.0.0.0/0` |
+| Outbound | All | All | `0.0.0.0/0` |
+
+For production, restrict SSH port 22 to a trusted IP or management network. Keep HTTP and outbound access limited to the actual application requirements.
+
+### EC2
+
+The EC2 resources receive:
+
+- AMI ID from `var.ec2_ami_id`
+- Instance type from the environment module
+- Subnet placement
+- Security group
+- Terraform-managed key pair
+- Root `gp3` volume
+- Nginx installation script through `user_data`
+- Environment and name tags
+
+The Nginx script is loaded from `Infrastructure/install_nginx.sh`.
+
+### S3
+
+Each environment currently receives the configured S3 bucket name. S3 can store application objects or infrastructure artifacts. For Terraform state, use a dedicated remote backend bucket with encryption, versioning, and controlled access rather than mixing application data and state casually.
+
+## 7. Prerequisites
+
+Install and configure:
+
+- Terraform
+- AWS CLI
+- An AWS account
+- AWS credentials with permission to create the required resources
+- A public SSH key for the Terraform-managed EC2 key pair
+
+Verify the tools and credentials:
+
+```powershell
+terraform version
+aws --version
+aws sts get-caller-identity
 ```
 
-# Terraform Workflow
+## 8. Terraform Workflow
 
-For each environment:
+Run all commands from the project root, where `main.tf` is located:
 
-### 1. Initialize
+```powershell
+cd "K:\Learning\Terraform Daily-Prac\Multi Staging Infrastructure"
+```
 
-```bash
+### Initialize
+
+```powershell
 terraform init
 ```
 
-### 2. Format
+Initialization downloads the AWS provider and prepares the local module.
 
-```bash
-terraform fmt
+### Format
+
+```powershell
+terraform fmt -recursive
 ```
 
-### 3. Validate
+### Validate
 
-```bash
+```powershell
 terraform validate
 ```
 
-### 4. Plan
+### Review the Plan
 
-```bash
+```powershell
 terraform plan
 ```
 
-### 5. Apply
+Check the plan for:
 
-```bash
+- Correct environment regions
+- Correct AMI IDs for those regions
+- Production private EC2 count equal to zero
+- Expected public and private subnet placement
+- Unexpected resource replacement or destruction
+
+### Apply
+
+```powershell
 terraform apply
 ```
 
-### 6. Destroy
+Review the plan and type `yes` when Terraform asks for confirmation.
 
-When the environment is no longer required:
+### Destroy
 
-```bash
+Destroying the root configuration removes resources across all three environments:
+
+```powershell
 terraform destroy
 ```
 
-# Recommended Order of Infrastructure
+Use this carefully, especially when the configuration manages production resources.
 
-Terraform automatically determines dependencies, but conceptually the infrastructure can be understood in this order:
+## 9. Troubleshooting
 
-```text
-VPC
- ↓
-Subnets
- ↓
-Internet Gateway
- ↓
-Route Tables
- ↓
-NAT Gateway
- ↓
-Security Groups
- ↓
-Key Pair
- ↓
-EC2
- ↓
-S3 / Terraform State
-```
+### AMI not found
 
-The actual Terraform dependency graph may differ because some resources can be created independently.
-
-# Environment Separation
-
-Development, Testing, and Production should have separate configuration and state.
-
-Example:
+Error examples:
 
 ```text
-Development
-    ↓
-development.tfvars
-    ↓
-development state
-
-Testing
-    ↓
-testing.tfvars
-    ↓
-testing state
-
-Production
-    ↓
-production.tfvars
-    ↓
-production state
+InvalidAMINotFound
+couldn't find resource
 ```
 
-This prevents changes in one environment from unintentionally affecting another environment.
+Check that the AMI ID exists in the same region as the module provider. AMI IDs are not global.
 
-# Security Guidelines
+### Availability Zone not found
 
-1. Never commit AWS access keys to Git.
-2. Never commit `.pem` private keys.
-3. Do not hardcode secrets in Terraform files.
-4. Restrict SSH access to trusted IP addresses.
-5. Avoid `0.0.0.0/0` for SSH unless specifically required.
-6. Review Terraform plans before applying changes.
-7. Keep Production state separate from Development and Testing.
-8. Enable appropriate S3 security controls and versioning for Terraform state.
-9. Use IAM permissions following least privilege.
-10. Destroy unused development resources to avoid unnecessary AWS costs.
+Check that `${var.region}a` exists in the selected region. Use AWS CLI or a Terraform availability-zone data source to discover valid zones.
 
-# Project Objective
+### State lock error
 
-The objective of this project is to practice building a complete AWS infrastructure using Terraform while learning:
+Do not run multiple Terraform commands against the same state. Wait for the other Terraform operation to finish. If a stale lock remains, verify that no Terraform process is running before removing or repairing the lock.
 
-* AWS networking
-* VPC architecture
-* Public and private subnets
-* Routing
-* Internet Gateway
-* NAT Gateway
-* Security Groups
-* EC2 provisioning
-* SSH access
-* S3
-* Terraform state
-* Environment separation
-* Terraform modules
-* Infrastructure as Code
+### Resource exists in AWS but not in state
+
+Use `terraform import` to bring an existing resource under management. Do not manually edit `terraform.tfstate`.
+
+### Resource is in state but missing from AWS
+
+Confirm the resource is truly deleted, then remove only the stale address with `terraform state rm`. Run `terraform plan` afterward so Terraform can propose the correct replacement.
+
+## 10. State and Security Practices
+
+For learning, local state may be used. For shared or production work:
+
+- Use separate state for Development, Testing, and Production.
+- Store state in an encrypted S3 backend.
+- Enable state versioning and locking.
+- Never commit `terraform.tfstate`, private keys, credentials, or secrets.
+- Review every production plan before applying it.
+- Use least-privilege AWS IAM permissions.
+- Restrict SSH access and avoid public IPs on private resources.
+
+## 11. Learning Goals
+
+This project demonstrates:
+
+- Terraform modules and environment-specific inputs
+- AWS provider regions
+- Region-specific AMIs and Availability Zones
+- VPC, subnet, route, NAT, and Internet Gateway configuration
+- EC2 provisioning with `count`
+- Conditional resource creation for Production
+- Terraform planning, state, and troubleshooting
